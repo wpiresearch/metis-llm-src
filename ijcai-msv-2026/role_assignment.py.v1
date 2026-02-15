@@ -1,0 +1,775 @@
+"""
+Role assignment module for the MSV Five-Role Architecture.
+IJCAI-ECAI 2026 Demo Track
+
+WHAT THIS MODULE DOES:
+    Adds principled role assignment to the existing System Two pipeline.
+    Everything in this file builds on existing code in metacognitive.py,
+    system_two_model.py, and prompts.py — nothing is invented.
+
+WHAT THIS MODULE DOES NOT DO:
+    - Does NOT modify metacognitive.py (MSV computation stays identical)
+    - Does NOT modify prompts.py (all prompts stay identical)
+    - Does NOT modify system_one_model.py (System 1 stays identical)
+    - Does NOT invent new MSV dimensions or fake/inject noise into values
+    - Does NOT generate post-hoc explanations for routing decisions
+
+DEPENDENCIES:
+    pip install scipy  (for scipy.optimize.linear_sum_assignment)
+    Everything else is already in the existing codebase.
+"""
+
+from dataclasses import dataclass, field
+from enum import StrEnum, auto
+from typing import Any
+
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+
+from metacognitive import MetacognitiveVector, compute_metacognitive_state_vector
+from prompts import Prompts
+from system_two_model import Node, NodeRole, NodeResponse, SystemTwoResponse
+
+import ollama
+
+# RJS: 2026-02-10:
+import logging
+
+#;logging.basicConfig(level=logging.INFO)   # Log INFO messages, as well?
+logger = logging.getLogger(__name__)
+
+def get_available_models() -> list[str]:
+    """
+    Query Ollama for all locally installed models.
+    Returns a list of model name strings.
+    Falls back to ["llama3.2"] if Ollama is unreachable.
+    """
+    try:
+        response = ollama.list()
+        models = [m.model for m in response.models]
+        logger.info(f"Available Ollama models: {models}")
+        return models if models else ["llama3.2"]
+    except Exception as e:
+        logger.warning(f"Could not query Ollama models: {e}")
+        return ["llama3.2"]
+
+
+
+# ============================================================
+# CONFIGURATION: Fitness weights and routing parameters
+# ============================================================
+
+# --- CODE WEIGHTS ---
+# These are copied EXACTLY from system_two_model.py lines 37-73.
+# They are reproduced here (not imported) so this module is self-contained
+# and any discrepancy with the original is immediately visible.
+CODE_ROLE_WEIGHTS: dict[str, dict[str, float]] = {
+    NodeRole.Domain_Expert: {
+        "emotional_response": 0.0,
+        "correctness": 0.7,
+        "experiential_matching": 0.0,
+        "conflict_information": 0.1,
+        "problem_importance": 0.2,
+    },
+    NodeRole.Critic: {
+        "emotional_response": 0.0,
+        "correctness": 0.5,
+        "experiential_matching": 0.05,
+        "conflict_information": 0.4,
+        "problem_importance": 0.05,
+    },
+    NodeRole.Evaluator: {
+        "emotional_response": 0.0,
+        "correctness": 0.4,
+        "experiential_matching": 0.0,
+        "conflict_information": 0.3,
+        "problem_importance": 0.3,
+    },
+    NodeRole.Generalist: {
+        "emotional_response": 0.2,
+        "correctness": 0.2,
+        "experiential_matching": 0.2,
+        "conflict_information": 0.2,
+        "problem_importance": 0.2,
+    },
+    NodeRole.Synthesizer: {
+        "emotional_response": 0.0,
+        "correctness": 0.25,
+        "experiential_matching": 0.25,
+        "conflict_information": 0.25,
+        "problem_importance": 0.25,
+    },
+}
+
+# --- PAPER WEIGHTS (IJCAI Equations 1-5) ---
+# These implement the equations from the IJCAI demo paper.
+# IMPORTANT: The specific weight VALUES (alpha_i, beta_i, etc.) are NOT
+# specified in the paper — only the DIMENSIONS each role uses.
+# The values below are initial calibration values that need empirical
+# validation. They are configurable via PAPER_FITNESS_WEIGHTS.
+#
+# Paper Eq 1:  f_Expert(m)  = α₁·CE + α₂·EM
+# Paper Eq 2:  f_Critic(m)  = β₁·CI + β₂·(1-CE)     ← NOTE: (1-CE) inversion
+# Paper Eq 3:  f_Eval(m)    = γ₁·CE + γ₂·CI + γ₃·EM
+# Paper Eq 4:  f_Synth(m)   = δ₁·EM + δ₂·CE
+# Paper Eq 5:  f_Gen(m)     = ε₁·PI + ε₂·CI + ε₃·ER
+#
+# Key difference from code weights:
+#   - Paper equations use ONLY the dimensions listed (others are 0)
+#   - Critic uses (1-CE) inversion (uncertainty, not confidence)
+#   - Values are normalized to [0,1] before applying equations
+PAPER_FITNESS_WEIGHTS: dict[str, dict[str, float]] = {
+    NodeRole.Domain_Expert: {"ce": 0.6, "em": 0.4},
+    NodeRole.Critic: {"ci": 0.5, "inv_ce": 0.5},  # inv_ce = (1 - CE)
+    NodeRole.Evaluator: {"ce": 0.35, "ci": 0.35, "em": 0.30},
+    NodeRole.Synthesizer: {"em": 0.55, "ce": 0.45},
+    NodeRole.Generalist: {"pi": 0.40, "ci": 0.35, "er": 0.25},
+}
+
+# --- ROUTING ---
+# Existing sigmoid (from metacognitive.py line 200):
+#   activation = 1 / (1 + exp(-value * 0.00001))
+#   threshold = 0.1
+#   BUG: For any practical MSV value, sigmoid ≈ 0.5 > 0.1, always true.
+#
+# Paper activation (IJCAI Eq 8):
+#   a = 0.30·(1-CE) + 0.25·CI + 0.25·PI + 0.20·(1-EM)
+#   threshold τ = 0.45
+PAPER_ROUTING_WEIGHTS: dict[str, float] = {
+    "inv_ce": 0.30,  # (1 - CE): uncertainty
+    "ci": 0.25,      # conflict
+    "pi": 0.25,      # importance
+    "inv_em": 0.20,  # (1 - EM): novelty
+}
+#;PAPER_ROUTING_THRESHOLD: float = 0.45
+PAPER_ROUTING_THRESHOLD: float = 0.15
+
+# Dialectical pipeline order (from paper Section 2.2, Eq 7):
+#   Expert → Critic → Evaluator → Synthesizer
+# Generalist is OUTSIDE the chain (boundary spanner, MSV-triggered).
+DIALECTICAL_SEQUENCE: list[str] = [
+    NodeRole.Domain_Expert,
+    NodeRole.Critic,
+    NodeRole.Evaluator,
+    NodeRole.Synthesizer,
+]
+
+
+# ============================================================
+# DATA STRUCTURES
+# ============================================================
+
+@dataclass
+class FitnessResult:
+    """Fitness scores for one agent across all roles."""
+    agent_index: int
+    scores: dict[str, float]  # role_name -> fitness score
+
+
+@dataclass
+class AssignmentResult:
+    """Complete result of role assignment, including both matrices."""
+    # Degenerate matrix: all rows identical (from single System 1 MSV)
+    degenerate_matrix: np.ndarray
+    degenerate_scores: list[FitnessResult]
+
+    # Heterogeneous matrix: each row from agent's own preliminary MSV
+    heterogeneous_matrix: np.ndarray | None
+    heterogeneous_scores: list[FitnessResult] | None
+
+    # Hungarian assignment (from heterogeneous matrix, or degenerate if no prelim)
+    assignment: dict[str, int]  # role_name -> agent_index
+    assignment_total_fitness: float
+
+    # The per-agent preliminary MSVs (None if no preliminary responses generated)
+    agent_msvs: list[MetacognitiveVector] | None
+
+    # Which model each agent used (None if no preliminary responses)
+    agent_model_names: list[str] | None
+
+    # Fitness mode used
+    fitness_mode: str  # "code_weights" or "paper_equations"
+
+
+@dataclass
+class RoutingResult:
+    """Routing decision with both methods shown."""
+    # Existing sigmoid routing
+    sigmoid_value: float
+    sigmoid_threshold: float
+    sigmoid_engages_system_two: bool
+
+    # Paper activation routing
+    paper_activation: float
+    paper_threshold: float
+    paper_engages_system_two: bool
+
+    # Component breakdown (paper activation only)
+    paper_components: dict[str, float]
+
+
+@dataclass
+class RolePipelineResult:
+    """Complete result of the five-role dialectical pipeline."""
+    routing: RoutingResult
+    system_one_msv: MetacognitiveVector
+    system_one_response: str
+
+    # Role assignment (only populated if System 2 is engaged)
+    assignment: AssignmentResult | None
+
+    # Dialectical pipeline responses (only if System 2)
+    role_responses: list[NodeResponse] | None
+
+    # Final response (System 1 passthrough or Synthesizer output)
+    final_response: str
+    final_msv: MetacognitiveVector | None
+
+    # Generalist annotation (only if MSV triggers fire)
+    generalist_annotation: str | None
+
+
+# ============================================================
+# FITNESS FUNCTIONS
+# ============================================================
+
+def _extract_msv_dimensions(msv: MetacognitiveVector) -> dict[str, float]:
+    """
+    Extract the five MSV dimension calculated_values.
+
+    Returns values on 0-100 scale (as stored in existing code).
+    All values come from msv.{dimension}.calculated_value which is
+    computed by the existing metacognitive.py _compute_value() methods.
+    """
+    return {
+        "er": float(msv.emotional_response.calculated_value),
+        "ce": float(msv.correctness.calculated_value),
+        "em": float(msv.experiential_matching.calculated_value),
+        "ci": float(msv.conflict_information.calculated_value),
+        "pi": float(msv.problem_importance.calculated_value),
+    }
+
+
+def compute_fitness_code_weights(msv: MetacognitiveVector) -> dict[str, float]:
+    """
+    Compute role fitness using EXISTING code weights from system_two_model.py.
+
+    This EXACTLY reproduces Node.get_role_preferences() (lines 75-87).
+    The computation is: for each role, sum(weight_i * dimension_i.calculated_value)
+    where dimension_i.calculated_value is on the 0-100 scale.
+
+    Result is on the 0-100 scale (weights sum to 1, values are 0-100).
+    """
+    # Map short names to attribute names used in code weights
+    attr_map = {
+        "emotional_response": msv.emotional_response.calculated_value,
+        "correctness": msv.correctness.calculated_value,
+        "experiential_matching": msv.experiential_matching.calculated_value,
+        "conflict_information": msv.conflict_information.calculated_value,
+        "problem_importance": msv.problem_importance.calculated_value,
+    }
+
+    fitness: dict[str, float] = {}
+    for role, weights in CODE_ROLE_WEIGHTS.items():
+        running_value = 0.0
+        for vector_name, weight in weights.items():
+            running_value += weight * attr_map[vector_name]
+        fitness[role] = running_value
+
+    return fitness
+
+
+def compute_fitness_paper(msv: MetacognitiveVector) -> dict[str, float]:
+    """
+    Compute role fitness using PAPER equations (IJCAI Eqs 1-5).
+
+    Key differences from code weights:
+    1. Values are normalized to [0,1] before computation
+    2. Only specified dimensions are used (others contribute 0)
+    3. Critic uses (1-CE) inversion — uncertainty, not confidence
+    4. Result is on [0,1] scale
+
+    PAPER REFERENCE:
+        Eq 1: f_Expert  = α₁·CE + α₂·EM
+        Eq 2: f_Critic  = β₁·CI + β₂·(1-CE)
+        Eq 3: f_Eval    = γ₁·CE + γ₂·CI + γ₃·EM
+        Eq 4: f_Synth   = δ₁·EM + δ₂·CE
+        Eq 5: f_Gen     = ε₁·PI + ε₂·CI + ε₃·ER
+    """
+    dims = _extract_msv_dimensions(msv)
+
+    # Normalize 0-100 → 0-1
+    norm = {k: v / 100.0 for k, v in dims.items()}
+
+    fitness: dict[str, float] = {}
+    for role, weights in PAPER_FITNESS_WEIGHTS.items():
+        score = 0.0
+        for dim_key, weight in weights.items():
+            if dim_key == "inv_ce":
+                score += weight * (1.0 - norm["ce"])
+            else:
+                score += weight * norm[dim_key]
+        fitness[role] = score
+
+    return fitness
+
+
+# ============================================================
+# HUNGARIAN ASSIGNMENT
+# ============================================================
+
+def hungarian_assignment(
+    fitness_scores: list[dict[str, float]],
+) -> tuple[dict[str, int], float]:
+    """
+    Optimal agent-to-role assignment via the Hungarian algorithm.
+
+    PAPER REFERENCE (IJCAI Eq 6):
+        φ* = argmax_φ Σ_{r∈R} f_r(m_{φ(r)})
+        Solved in O(|R|² · n) via scipy.optimize.linear_sum_assignment.
+
+    Args:
+        fitness_scores: List of N dicts, each mapping role -> fitness.
+            fitness_scores[i][role] = fitness of agent i for role.
+
+    Returns:
+        (assignment, total_fitness) where:
+            assignment: dict mapping role_name -> agent_index
+            total_fitness: sum of assigned fitness values
+
+    NOTE ON HOMOGENEOUS AGENTS:
+        If all agents have identical MSVs (e.g., same System 1 MSV),
+        all rows in the fitness matrix are identical. The Hungarian
+        algorithm will return a valid assignment but ANY permutation
+        achieves the same total — the assignment is degenerate.
+        This is flagged in the AssignmentResult for transparency.
+    """
+    if not fitness_scores:
+        return {}, 0.0
+
+    roles = list(fitness_scores[0].keys())
+    n_agents = len(fitness_scores)
+    n_roles = len(roles)
+
+    # Build the cost matrix (n_agents × n_roles)
+    # scipy minimizes, so we negate fitness to maximize
+    cost_matrix = np.zeros((n_agents, n_roles))
+    for i, scores in enumerate(fitness_scores):
+        for j, role in enumerate(roles):
+            cost_matrix[i, j] = -scores[role]  # negate for minimization
+
+    # Handle rectangular matrices (more agents than roles or vice versa)
+    row_indices, col_indices = linear_sum_assignment(cost_matrix)
+
+    assignment: dict[str, int] = {}
+    total_fitness = 0.0
+    for row, col in zip(row_indices, col_indices):
+        if col < n_roles:  # safety check
+            role = roles[col]
+            assignment[role] = row
+            total_fitness += fitness_scores[row][role]
+
+    return assignment, total_fitness
+
+
+# ============================================================
+# ROUTING
+# ============================================================
+
+def compute_routing(msv: MetacognitiveVector) -> RoutingResult:
+    """
+    Compute routing decision using BOTH existing and paper methods.
+
+    Shows side-by-side comparison for the demo.
+
+    EXISTING METHOD (metacognitive.py line 200):
+        activation = sigmoid(calculated_value * 0.00001)
+        BUG: sigmoid(x * 1e-5) ≈ 0.5 for all practical x, so
+        should_engage_system_two() always returns True (0.5 >= 0.1).
+
+    PAPER METHOD (IJCAI Eq 8):
+        a = 0.30·(1-CE) + 0.25·CI + 0.25·PI + 0.20·(1-EM)
+        System 2 if a >= 0.45
+    """
+    # --- Existing sigmoid (reproduced exactly) ---
+    import math
+    sigmoid_value = 1 / (1 + math.exp(-msv.calculated_value * 0.00001))
+    sigmoid_threshold = msv.activation_threshold  # default 0.1
+    sigmoid_engages = sigmoid_value >= sigmoid_threshold
+
+    # --- Paper activation ---
+    dims = _extract_msv_dimensions(msv)
+    norm = {k: v / 100.0 for k, v in dims.items()}
+
+    components = {
+        "uncertainty (1-CE)": PAPER_ROUTING_WEIGHTS["inv_ce"] * (1.0 - norm["ce"]),
+        "conflict (CI)": PAPER_ROUTING_WEIGHTS["ci"] * norm["ci"],
+        "importance (PI)": PAPER_ROUTING_WEIGHTS["pi"] * norm["pi"],
+        "novelty (1-EM)": PAPER_ROUTING_WEIGHTS["inv_em"] * (1.0 - norm["em"]),
+    }
+    paper_activation = sum(components.values())
+    paper_engages = paper_activation >= PAPER_ROUTING_THRESHOLD
+
+    return RoutingResult(
+        sigmoid_value=sigmoid_value,
+        sigmoid_threshold=sigmoid_threshold,
+        sigmoid_engages_system_two=sigmoid_engages,
+        paper_activation=paper_activation,
+        paper_threshold=PAPER_ROUTING_THRESHOLD,
+        paper_engages_system_two=paper_engages,
+        paper_components=components,
+    )
+
+
+# ============================================================
+# PRELIMINARY RESPONSES (for heterogeneous agent MSVs)
+# ============================================================
+
+# RJS: 2026-02-10:
+# --- AGENT MODEL CONFIGURATION ---
+# Set to None to auto-detect from Ollama at startup.
+# Set to a list of model names to use specific models.
+# Example: AGENT_MODELS = ["llama3.2", "qwen3:4b", "gemma3:4b", "qwen3:8b", "gpt-oss"]
+AGENT_MODELS: list[str] | None = None  # None = auto-detect
+
+def _get_agent_models(n_agents: int = 5) -> list[str]:
+    """
+    Return a list of n_agents model names for the preliminary response phase.
+
+    If AGENT_MODELS is set, uses those (cycling if fewer than n_agents).
+    If None, auto-detects from Ollama and picks up to n_agents distinct models.
+    """
+    if AGENT_MODELS is not None:
+        models = AGENT_MODELS
+    else:
+        models = get_available_models()
+
+    if len(models) == 0:
+        models = ["llama3.2"]
+
+    # Cycle through available models to fill n_agents slots
+    result = []
+    for i in range(n_agents):
+        result.append(models[i % len(models)])
+    return result
+
+
+async def generate_preliminary_responses(
+    user_prompt: str,
+    n_agents: int = 5,
+) -> tuple[list[str], list[str]]:
+    """
+    Have each agent independently generate a preliminary response.
+
+    Each agent uses a DIFFERENT model (if available) to produce genuinely
+    heterogeneous MSVs. If only one model is installed, all agents use it
+    (falling back to sampling variability for differentiation).
+
+    Returns:
+        (responses, model_names) — both as lists of length n_agents
+    """
+    agent_models = _get_agent_models(n_agents)
+    logger.info(f"Preliminary response models: {agent_models}")
+    print(f"[role_assignment] Preliminary response models: {agent_models}")
+
+    responses: list[str] = []
+    for i in range(n_agents):
+        model = agent_models[i]
+        logger.info(f"  Agent {i}: generating with {model}")
+        print(f"[role_assignment]   Agent {i}: generating with {model}")
+        response = ollama.chat(
+            model=model,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        responses.append(response.message.content)
+    return responses, agent_models
+
+
+async def compute_agent_msvs(
+    responses: list[str],
+    user_prompt: str,
+    prompts: Prompts,
+    weights: dict[str, dict[str, float]],
+) -> list[MetacognitiveVector]:
+    """
+    Compute MSV for each agent's preliminary response.
+
+    Uses the EXISTING compute_metacognitive_state_vector() from
+    metacognitive.py — no modifications. Each MSV is computed exactly
+    as it would be for any System 1 response.
+    """
+    import asyncio
+
+    msvs = await asyncio.gather(*[
+        compute_metacognitive_state_vector(
+            prompts=prompts,
+            weights=weights,
+            response=resp,
+            original_prompt=user_prompt,
+        )
+        for resp in responses
+    ])
+    return list(msvs)
+
+
+# ============================================================
+# FULL PIPELINE
+# ============================================================
+
+async def run_role_pipeline(
+    user_prompt: str,
+    system_one_response: str,
+    system_one_msv: MetacognitiveVector,
+    prompts: Prompts,
+    weights: dict[str, dict[str, float]],
+    fitness_mode: str = "paper_equations",  # or "code_weights"
+    generate_preliminary: bool = True,
+    n_agents: int = 5,
+) -> RolePipelineResult:
+    """
+    Execute the complete five-role pipeline.
+
+    Steps:
+    1. Compute routing (both sigmoid and paper methods)
+    2. If System 2:
+       a. Build degenerate fitness matrix (System 1 MSV, all rows identical)
+       b. Optionally: generate preliminary responses for heterogeneous MSVs
+       c. Run Hungarian assignment
+       d. Execute dialectical pipeline: Expert → Critic → Evaluator → Synthesizer
+       e. Check Generalist triggers
+    3. Return complete result with full transparency
+
+    Args:
+        user_prompt: Original user query
+        system_one_response: Response from system_one_model.get_response()
+        system_one_msv: MSV computed on system_one_response (from metacognitive.py)
+        prompts: Prompts instance (unchanged from existing code)
+        weights: Weight configuration (unchanged from existing code)
+        fitness_mode: "code_weights" or "paper_equations"
+        generate_preliminary: If True, generate prelim responses for heterogeneous MSVs
+        n_agents: Number of agents (default 5, one per role)
+    """
+    # --- Step 1: Routing ---
+    routing = compute_routing(system_one_msv)
+
+    # Determine which routing to use for the actual decision
+    # (paper routing is the new behavior; sigmoid shown for comparison)
+    engage_system_two = routing.paper_engages_system_two
+
+    if not engage_system_two:
+        # System 1 passthrough — no role assignment needed
+        return RolePipelineResult(
+            routing=routing,
+            system_one_msv=system_one_msv,
+            system_one_response=system_one_response,
+            assignment=None,
+            role_responses=None,
+            final_response=system_one_response,
+            final_msv=system_one_msv,
+            generalist_annotation=None,
+        )
+
+    # --- Step 2: Fitness computation ---
+    fitness_fn = (
+        compute_fitness_code_weights
+        if fitness_mode == "code_weights"
+        else compute_fitness_paper
+    )
+
+    # 2a. Degenerate matrix (all rows from System 1 MSV)
+    single_fitness = fitness_fn(system_one_msv)
+    degenerate_scores = [
+        FitnessResult(agent_index=i, scores=single_fitness.copy())
+        for i in range(n_agents)
+    ]
+    degenerate_matrix = np.array([
+        [single_fitness[role] for role in DIALECTICAL_SEQUENCE + [NodeRole.Generalist]]
+        for _ in range(n_agents)
+    ])
+
+    # 2b. Heterogeneous matrix (from preliminary responses)
+    agent_msvs = None
+    heterogeneous_scores = None
+    heterogeneous_matrix = None
+
+    agent_model_names = None
+    if generate_preliminary:
+        prelim_responses, agent_model_names = await generate_preliminary_responses(user_prompt, n_agents)
+        agent_msvs = await compute_agent_msvs(
+            prelim_responses, user_prompt, prompts, weights
+        )
+        heterogeneous_scores = [
+            FitnessResult(agent_index=i, scores=fitness_fn(msv))
+            for i, msv in enumerate(agent_msvs)
+        ]
+        all_roles = DIALECTICAL_SEQUENCE + [NodeRole.Generalist]
+        heterogeneous_matrix = np.array([
+            [fs.scores[role] for role in all_roles]
+            for fs in heterogeneous_scores
+        ])
+
+    # --- Step 3: Hungarian assignment ---
+    # Use heterogeneous if available, otherwise degenerate
+    scores_for_assignment = (
+        [fs.scores for fs in heterogeneous_scores]
+        if heterogeneous_scores
+        else [fs.scores for fs in degenerate_scores]
+    )
+    assignment_map, total_fitness = hungarian_assignment(scores_for_assignment)
+
+    assignment = AssignmentResult(
+        degenerate_matrix=degenerate_matrix,
+        degenerate_scores=degenerate_scores,
+        heterogeneous_matrix=heterogeneous_matrix,
+        heterogeneous_scores=heterogeneous_scores,
+        assignment=assignment_map,
+        assignment_total_fitness=total_fitness,
+        agent_msvs=agent_msvs,
+        agent_model_names=agent_model_names,
+        fitness_mode=fitness_mode,
+    )
+
+    # --- Step 4: Dialectical pipeline ---
+    # Create Node instances for assigned agents
+    role_responses: list[NodeResponse] = []
+    previous_response = system_one_response
+    previous_role = "system one"
+    synthesizer_response = None
+    synthesizer_msv = None
+
+    for role in DIALECTICAL_SEQUENCE:
+        agent_idx = assignment_map.get(role)
+        if agent_idx is None:
+            continue
+
+        node = Node()
+        node.assign_role(NodeRole(role))
+
+        # Generate role-specific response using EXISTING Node.get_response()
+        # This uses the role prompts from prompts.py (unchanged)
+        node_response = node.get_response(
+            user_prompt, previous_response, previous_role, prompts
+        )
+
+        # Compute MSV on role response using EXISTING compute_metacognitive_state_vector()
+        state = await compute_metacognitive_state_vector(
+            prompts, weights, node_response, previous_response
+        )
+
+        role_responses.append(
+            NodeResponse(node_role=role, node_response=node_response, node_msv=state)
+        )
+
+        if role == NodeRole.Synthesizer:
+            synthesizer_response = node_response
+            synthesizer_msv = state
+
+        previous_response = node_response
+        previous_role = role
+
+    # --- Step 5: Generalist trigger check ---
+    # Generalist fires when MSV-based triggers are met (from paper Section 2.2):
+    #   CI > 0.65, EM < 0.35, or PI > 0.70
+    # Uses the LAST stage MSV (Synthesizer's) to decide.
+    generalist_annotation = None
+    if synthesizer_msv:
+        dims = _extract_msv_dimensions(synthesizer_msv)
+        norm = {k: v / 100.0 for k, v in dims.items()}
+
+        generalist_triggers = (
+            norm["ci"] > 0.65
+            or norm["em"] < 0.35
+            or norm["pi"] > 0.70
+        )
+
+        if generalist_triggers:
+            gen_agent_idx = assignment_map.get(NodeRole.Generalist)
+            if gen_agent_idx is not None:
+                gen_node = Node()
+                gen_node.assign_role(NodeRole.Generalist)
+                generalist_annotation = gen_node.get_response(
+                    user_prompt,
+                    synthesizer_response,
+                    NodeRole.Synthesizer,
+                    prompts,
+                )
+
+    # --- Build result ---
+    final_response = synthesizer_response or system_one_response
+    final_msv = synthesizer_msv or system_one_msv
+
+    return RolePipelineResult(
+        routing=routing,
+        system_one_msv=system_one_msv,
+        system_one_response=system_one_response,
+        assignment=assignment,
+        role_responses=role_responses,
+        final_response=final_response,
+        final_msv=final_msv,
+        generalist_annotation=generalist_annotation,
+    )
+
+
+# ============================================================
+# UTILITY: Format results for display/debugging
+# ============================================================
+
+def format_fitness_matrix(
+    scores: list[FitnessResult],
+    roles: list[str] | None = None,
+) -> str:
+    """Format fitness matrix as a readable table for debugging."""
+    if not scores:
+        return "(empty)"
+    if roles is None:
+        roles = list(scores[0].scores.keys())
+
+    header = "Agent | " + " | ".join(f"{r:>12s}" for r in roles)
+    lines = [header, "-" * len(header)]
+    for fs in scores:
+        vals = " | ".join(f"{fs.scores[r]:>12.2f}" for r in roles)
+        lines.append(f"  {fs.agent_index:3d} | {vals}")
+    return "\n".join(lines)
+
+
+def format_assignment(result: AssignmentResult) -> str:
+    """Format assignment result for display."""
+    lines = [
+        f"Fitness mode: {result.fitness_mode}",
+        f"Total fitness: {result.assignment_total_fitness:.2f}",
+        "",
+        "Assignment:",
+    ]
+    for role, agent_idx in result.assignment.items():
+        lines.append(f"  {role:>20s} → Agent {agent_idx}")
+
+    lines.append("")
+    lines.append("Degenerate matrix (all rows identical — from System 1 MSV):")
+    lines.append(format_fitness_matrix(result.degenerate_scores))
+
+    if result.heterogeneous_scores:
+        lines.append("")
+        lines.append("Heterogeneous matrix (from preliminary response MSVs):")
+        lines.append(format_fitness_matrix(result.heterogeneous_scores))
+
+    return "\n".join(lines)
+
+
+def format_routing(routing: RoutingResult) -> str:
+    """Format routing decision for display."""
+    lines = [
+        "=== ROUTING COMPARISON ===",
+        "",
+        f"Existing sigmoid: {routing.sigmoid_value:.6f} "
+        f"(threshold={routing.sigmoid_threshold}) "
+        f"→ {'System 2' if routing.sigmoid_engages_system_two else 'System 1'}",
+        f"  NOTE: sigmoid(x * 1e-5) ≈ 0.5 for all practical x → always System 2",
+        "",
+        f"Paper activation:  {routing.paper_activation:.4f} "
+        f"(threshold={routing.paper_threshold}) "
+        f"→ {'System 2' if routing.paper_engages_system_two else 'System 1'}",
+        "  Components:",
+    ]
+    for name, value in routing.paper_components.items():
+        lines.append(f"    {name:>25s}: {value:.4f}")
+    return "\n".join(lines)

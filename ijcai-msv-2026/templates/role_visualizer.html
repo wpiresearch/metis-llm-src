@@ -1,0 +1,65 @@
+<!-- templates/role_visualizer.html -->
+
+{# Routing Gauge #}
+{% if viz.get("routing_gauge") %}
+<div class="box">
+    <h5 class="title is-5">Routing Decision</h5>
+    {{ viz["routing_gauge"][0] | safe }}
+    {{ viz["routing_gauge"][1] | safe }}
+</div>
+{% endif %}
+
+{# Pipeline Graph #}
+{% if viz.get("pipeline_graph") %}
+<div class="box">
+    <h5 class="title is-5">Dialectical Pipeline</h5>
+    {{ viz["pipeline_graph"][0] | safe }}
+    {{ viz["pipeline_graph"][1] | safe }}
+    <div id="node-info" class="mt-3">
+        <p class="has-text-grey-light">Click a node to see details...</p>
+    </div>
+</div>
+{% endif %}
+
+{# Fitness Heatmaps #}
+{% if viz.get("degenerate_heatmap") %}
+<div class="box">
+    <h5 class="title is-5">Fitness Matrix (Degenerate)</h5>
+    <p class="is-size-7 has-text-grey">All rows identical — computed from single
+        System 1 MSV. Hungarian assignment is valid but arbitrary.
+        Red border = assigned cell.</p>
+    {{ viz["degenerate_heatmap"][0] | safe }}
+    {{ viz["degenerate_heatmap"][1] | safe }}
+</div>
+{% endif %}
+
+{% if viz.get("heterogeneous_heatmap") %}
+<div class="box">
+    <h5 class="title is-5">Fitness Matrix (Heterogeneous)</h5>
+    <p class="is-size-7 has-text-grey">Rows differ — each agent generated a
+        preliminary response with its own MSV. Hungarian assignment is now
+        meaningful. Red border = assigned cell.</p>
+    {{ viz["heterogeneous_heatmap"][0] | safe }}
+    {{ viz["heterogeneous_heatmap"][1] | safe }}
+</div>
+{% endif %}
+
+{# MSV Evolution #}
+{% if viz.get("msv_evolution") %}
+<div class="box">
+    <h5 class="title is-5">MSV Evolution Across Stages</h5>
+    <p class="is-size-7 has-text-grey">How MSV dimensions change through the
+        dialectical pipeline. Hypothesis: CI should decrease and CE should
+        increase across stages.</p>
+    {{ viz["msv_evolution"][0] | safe }}
+    {{ viz["msv_evolution"][1] | safe }}
+</div>
+{% endif %}
+
+{# Existing MSV bar charts for comparison #}
+{% for bar_parts in msv_bar_graphs %}
+<div class="box">
+    {{ bar_parts[0] | safe }}
+    {{ bar_parts[1] | safe }}
+</div>
+{% endfor %}

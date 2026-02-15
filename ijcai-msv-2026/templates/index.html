@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chat Interface</title>
+    <!-- <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.7/dist/htmx.min.js" integrity="sha384-ZBXiYtYQ6hJ2Y0ZNoYuI+Nq5MqWBr+chMrS/RkXpNzQCApHEhOt2aY8EJgqwHLkJ" crossorigin="anonymous"></script> -->
+    <!-- <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bulma/0.9.3/css/bulma.min.css"> -->
+    <!-- <script src="https://cdn.bokeh.org/bokeh/release/bokeh-3.8.0.min.js" crossorigin="anonymous"></script> -->
+    <!-- <script src="https://cdn.bokeh.org/bokeh/release/bokeh-widgets-3.8.0.min.js" crossorigin="anonymous"></script> -->
+    <!-- <script src="https://cdn.bokeh.org/bokeh/release/bokeh-tables-3.8.0.min.js" crossorigin="anonymous"></script> -->
+    <!-- <script src="https://cdn.bokeh.org/bokeh/release/bokeh-gl-3.8.0.min.js" crossorigin="anonymous"></script> -->
+    <!-- <script src="https://cdn.bokeh.org/bokeh/release/bokeh-mathjax-3.8.0.min.js" crossorigin="anonymous"></script> -->
+    <!-- <script src="https://unpkg.com/htmx-ext-json-enc@2.0.1/json-enc.js"></script> -->
+    
+    <!-- vendored versions -->
+    <script src="{{ url_for('static', path='htmx.min.js') }}"></script>
+    <link href="{{ url_for('static', path='bulma.min.css') }}" rel="stylesheet" />
+    <script src="{{ url_for('static', path='bokeh-3.8.0.min.js') }}"></script>
+    <script src="{{ url_for('static', path='bokeh-widgets-3.8.0.min.js') }}"></script>
+    <script src="{{ url_for('static', path='bokeh-tables-3.8.0.min.js') }}"></script>
+    <script src="{{ url_for('static', path='bokeh-gl-3.8.0.min.js') }}"></script>
+    <script src="{{ url_for('static', path='bokeh-mathjax-3.8.0.min.js') }}"></script>
+    <script src="{{ url_for('static', path='json-enc.js') }}"></script>
+
+    <style>
+        /* Basic Styles for tabs */
+        .tab-content {
+            margin-top: 20px;
+        }
+        .hidden {
+            display: none;
+        }
+        
+        .main-container {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+        
+        .card {
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        }
+        
+        .section-box {
+            background: #f7fafc;
+            border-radius: 8px;
+            border-left: 4px solid #667eea;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+        
+        .section-title {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 1.5rem;
+        }
+        
+        .section-title::before {
+            content: '●';
+            color: #667eea;
+            font-size: 1.2rem;
+        }
+        
+        .submit-gradient {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border: none;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        
+        .submit-gradient:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 25px rgba(102, 126, 234, 0.4);
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .config-section-box {
+            background: #f7fafc;
+            border-radius: 8px;
+            border-left: 4px solid #667eea;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+        
+        .config-section-title {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 1.5rem;
+        }
+        
+        .config-section-title::before {
+            content: '●';
+            color: #667eea;
+            font-size: 1.2rem;
+        }
+        
+        .config-submit-gradient {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border: none;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        
+        .config-submit-gradient:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 25px rgba(102, 126, 234, 0.4);
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        #node-info {
+            margin-top: 20px;
+            padding: 15px;
+            border: 2px solid #ddd;
+            border-radius: 5px;
+            min-height: 50px;
+            background-color: #f9f9f9;
+        }
+        .node-detail {
+            font-size: 16px;
+            color: #333;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 class="title">System 1/System 2 Demo</h1>
+        <div class="tabs is-boxed">
+            <ul id="admin-tabs">
+                <li class="is-active" data-target="tab-admin-1"><a>Chat Interface</a></li>
+                <li data-target="tab-admin-2"><a>Admin Interface</a></li>
+            </ul>
+        </div>
+        <div class="tab-content">
+            <div id="admin-content">
+                <div class="tab-admin-item " id="tab-admin-1">
+                    <div id="chatbox" class="box" style="height: 400px; overflow-y: auto;">
+                        <!-- Chat messages will be appended here -->
+                    </div>
+                    <form id="chat-form" hx-post="/chat" hx-target="#chatbox" hx-swap="beforeend">
+                        <div class="field has-addons">
+                            <div class="control is-expanded">
+                                <input id="user_input" class="input" type="text" name="user_input" placeholder="Type your message..." required>
+                            </div>
+                            <div class="control">
+                                <button class="button is-info" type="submit">Send</button>
+                            </div>
+                        </div>
+                    </form>
+                    <p><em>Demo is intended for single user environments, if on a multi-user environment responses and contexts may be crossed and leaked between sessions.<br/>
+                        Do not use for production.<br/>
+                        Do not reveal sensitive information, chats may be logged.<br/></em></p>
+<!-- RJS: 2026-02-10 -->
+<!-- Five-Role Pipeline -->
+<hr>
+<p class="has-text-weight-bold has-text-link">Five-Role Pipeline</p>
+<div class="field has-addons">
+    <div class="control is-expanded">
+        <input id="role_input" class="input" type="text"
+               name="user_input"
+               placeholder="Type a query for the five-role pipeline..."
+               required>
+    </div>
+    <div class="control">
+        <button class="button is-link" type="submit"
+                hx-post="/role_chat"
+                hx-target="#chatbox"
+                hx-swap="beforeend"
+                hx-include="#role_input, [name='fitness_mode']">
+            Role Chat
+        </button>
+    </div>
+</div>
+<div class="field">
+    <label class="label is-small">Fitness Mode:</label>
+    <div class="control">
+        <div class="select is-small">
+            <select name="fitness_mode">
+                <option value="paper_equations">Paper Equations (IJCAI Eqs 1-5)</option>
+                <option value="code_weights">Code Weights (Existing)</option>
+            </select>
+        </div>
+    </div>
+</div>
+                    <div class="control">
+                        <button class="button is-info" type="submit" hx-post="/reset" hx-swap="none">Reset</button>
+                    </div>
+                    <div id="system-details">
+                        <!-- System details will be loaded here -->
+                    </div>
+                </div>
+                <div class="tab-admin-item hidden" id="tab-admin-2">
+                    {% include 'admin_panel.html' %}
+                </div>
+            </div>
+        </div>
+    </div>
+    
+
+    <script>
+        // Handle the response from the server
+// RJS: 2026-02-10:
+document.body.addEventListener('htmx:beforeSwap', function(event) {
+    if (event.detail.target.id === 'chatbox') {
+        const chatbox = document.getElementById('chatbox');
+
+        // Determine which input triggered this request
+        const roleInput = document.getElementById('role_input');
+        const mainInput = document.getElementById('user_input');
+        
+        // If role_input has a value, this came from the Five-Role Pipeline button
+        let userInput = '';
+        if (roleInput && roleInput.value.trim() !== '') {
+            userInput = roleInput.value;
+            roleInput.value = '';  // Clear it
+        } else {
+            userInput = mainInput.value;
+            mainInput.value = '';  // Clear it
+        }
+
+        // Create a message element for the user's input
+        const userMessage = document.createElement('div');
+        userMessage.className = 'message is-info';
+        userMessage.innerHTML = `<div class="message-body">You: ${userInput}</div>`;
+        chatbox.appendChild(userMessage);
+
+        // Scroll to the bottom of the chatbox
+        chatbox.scrollTop = chatbox.scrollHeight; 
+    }
+});
+        document.body.addEventListener('htmx:afterSwap', function(event) {
+            if (event.detail.target.id === 'chatbox') {
+                document.getElementById('chat-form').reset(); // Clear the input
+                document.getElementById('chatbox').scrollTop = chatbox.scrollHeight; // Scroll to bottom
+            } else if (event.detail.target.id === 'system-details') {
+                refreshClickableTabs();
+            }
+        });
+        refreshClickableTabs = function () {
+            const mainTabs = document.querySelectorAll('#main-tabs li');
+            const msvTabs = document.querySelectorAll('#msv-tabs li');
+            const adminTabs = document.querySelectorAll('#admin-tabs li');
+
+            const subTabs = document.querySelectorAll('#sub-tabs li');
+            const contentItems = document.querySelectorAll('.tab-item');
+
+            const msvContentItems = document.querySelectorAll('.tab9-item');
+            const adminContentItems = document.querySelectorAll('.tab-admin-item');
+
+            adminTabs.forEach(tab => {
+                tab.addEventListener('click', function () {
+                    const target = this.dataset.target;
+                    adminTabs.forEach(t => t.classList.remove('is-active'));
+                    this.classList.add('is-active');
+
+                    // Update content to show the first subtab of the active main tab
+                    displaySingleTabContent(target, adminContentItems);
+                });
+            });
+
+            msvTabs.forEach(tab => {
+                tab.addEventListener('click', function () {
+                    const target = this.dataset.target;
+                    msvTabs.forEach(t => t.classList.remove('is-active'));
+                    this.classList.add('is-active');
+
+                    // Update content to show the first subtab of the active main tab
+                    displaySingleTabContent(target, msvContentItems);
+                });
+            });
+
+            function displaySingleTabContent(mainTab, contentItems) {
+                contentItems.forEach(item => {
+                    item.classList.add('hidden'); // Hide all content items
+                });
+                const activeItem = document.getElementById(`${mainTab}`);
+                if (activeItem) {
+                    activeItem.classList.remove('hidden'); // Show the selected content
+                }
+            }
+
+            // Main tab click event
+            mainTabs.forEach(tab => {
+                tab.addEventListener('click', function () {
+                    const target = this.dataset.target;
+                    mainTabs.forEach(t => t.classList.remove('is-active'));
+                    this.classList.add('is-active');
+
+                    // Reset sub-tabs to the first one
+                    subTabs.forEach(t => t.classList.remove('is-active'));
+                    subTabs[0].classList.add('is-active');
+
+                    // Update content to show the first subtab of the active main tab
+                    displayContent(target, subTabs[0].dataset.target);
+                });
+            });
+
+            // Sub-tab click event
+            subTabs.forEach(tab => {
+                tab.addEventListener('click', function () {
+                    const activeMainTab = document.querySelector('#main-tabs li.is-active').dataset.target;
+                    const target = this.dataset.target;
+
+                    subTabs.forEach(t => t.classList.remove('is-active'));
+                    this.classList.add('is-active');
+
+                    // Update content
+                    displayContent(activeMainTab, target);
+                });
+            });
+
+            // Function to display content based on selected tabs
+            function displayContent(mainTab, subTab) {
+                contentItems.forEach(item => {
+                    item.classList.add('hidden'); // Hide all content items
+                });
+                const activeItem = document.getElementById(`${mainTab}-${subTab}`);
+                if (activeItem) {
+                    activeItem.classList.remove('hidden'); // Show the selected content
+                }
+            }
+
+            // Initial content load
+            displayContent('tab1', 'subtab1');
+        };
+        document.addEventListener("DOMContentLoaded", refreshClickableTabs);
+    </script>
+
+</body>
+</html>

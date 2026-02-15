@@ -1,0 +1,10 @@
+fastapi
+ollama
+Jinja2
+uvicorn
+python-multipart
+NRCLex
+bokeh
+networkx
+scipy
+numpy

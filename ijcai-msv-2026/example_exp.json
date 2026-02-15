@@ -1,0 +1,6 @@
+{
+	"experiments":[
+		{"id": "abc", "prompts":["What's good?", "Sounds interesting!"]},
+		{"id": "def", "prompts":["What's the weather like?"]}
+	]
+}

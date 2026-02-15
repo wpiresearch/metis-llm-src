@@ -1,0 +1,95 @@
+<div class="columns">
+<!-- Column 1 -->
+  <div class="column">
+    <div class="tabs is-boxed">
+        <ul id="msv-tabs">
+            {% for item in msv_json %}
+                {% if loop.first %}
+                    {% set class = 'is-active' %}
+                {% else %}
+                    {% set class = '' %}
+                {% endif %}
+                <li class="{{class}}" data-target="tab9-{{loop.index}}"><a>System {{loop.index}} MSV</a></li>
+            {% endfor %}
+        </ul>
+    </div>
+    <div class="tab-content">
+        <div id="msv-content">
+            {% for item in msv_json %}
+                {% if loop.first %}
+                    {% set class = 'tab9-item' %}
+                {% else %}
+                    {% set class = 'tab9-item hidden' %}
+                {% endif %}
+                <div class="{{class}}" id="tab9-{{loop.index}}"><pre>{{item}}</pre></div>
+            {% endfor %}
+        </div>
+    </div>
+ </div>
+ <!-- Column 2 -->
+  <div class="column">
+      <div class="container">
+        <!-- First Level Tabs -->
+        <div class="tabs is-boxed">
+            <ul id="main-tabs">
+                {% for item in msv_graphs %}
+                    {% if loop.first %}
+                        {% set class = 'is-active' %}
+                    {% else %}
+                        {% set class = '' %}
+                    {% endif %}
+                <li class="{{class}}"data-target="tab{{loop.index}}"><a>System {{loop.index}}</a></li>
+                {% endfor %}
+            </ul>
+        </div>
+
+        <!-- Second Level Tabs -->
+        <div class="tabs is-boxed is-small">
+            <ul id="sub-tabs">
+                {% for item in msv_graphs[0][1].keys() %}
+                    {% if loop.first %}
+                        {% set class = 'is-active' %}
+                    {% else %}
+                        {% set class = '' %}
+                    {% endif %}
+                    <li class="{{class}}" data-target="subtab{{loop.index}}"><a>{{item}}</a></li>
+                {% endfor %}
+            </ul>
+        </div>
+
+        <!-- Content Container -->
+        <div class="tab-content">
+            <div id="content">
+                {% for item in msv_graphs %}
+                {% set outer_loop = loop %}
+                    {% autoescape false %}
+                    {{item[0]}}
+                    {{msv_bar_graphs[outer_loop.index0][0]}}
+                    {% endautoescape %}
+                    {% for graph_key, graph in item[1].items() %}
+                        {% if loop.first %}
+                            {% set class = 'tab-item' %}
+                        {% else %}
+                            {% set class = 'tab-item hidden' %}
+                        {% endif %}
+                        <div class="{{class}}" id="tab{{outer_loop.index}}-subtab{{loop.index}}">
+                            {% autoescape false %}{{graph}}{% endautoescape %}
+                            {% autoescape false %}{{msv_bar_graphs[outer_loop.index0][1][graph_key]}}{% endautoescape %}
+                            {% if outer_loop.index == 2 and loop.index == 1%}
+                                <div>
+                                    {% autoescape false %}
+                                        {{system_two_graph[0]}}
+                                        {{system_two_graph[1]}}
+                                    {% endautoescape %}
+                                    <div id="node-info">
+                                        <em>Click on a node to see details...</em>
+                                    </div>
+                                </div>
+                            {% endif %}
+                        </div>
+                    {% endfor %}
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+  </div>
